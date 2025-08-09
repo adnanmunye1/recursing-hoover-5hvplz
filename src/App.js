@@ -280,7 +280,7 @@ function AllergyInput({ value, onChange, nka, setNka }) {
         />
         <span className="muted">No known allergies (NKA)</span>
       </label>
-      <div className="row" style={{ opacity: nka ? 0.5 : 1 }}>
+      <div className="row wrap" style={{ opacity: nka ? 0.5 : 1 }}>
         <input
           className="input"
           placeholder="Allergen (e.g., Penicillin, Nuts)"
@@ -289,8 +289,7 @@ function AllergyInput({ value, onChange, nka, setNka }) {
           disabled={nka}
         />
         <select
-          className="input"
-          style={{ maxWidth: 220 }}
+          className="input select"
           value={reaction}
           onChange={(e) => setReaction(e.target.value)}
           disabled={nka}
@@ -303,7 +302,7 @@ function AllergyInput({ value, onChange, nka, setNka }) {
         </select>
         <button
           type="button"
-          className="btn btn-secondary"
+          className="btn btn-neutral"
           onClick={add}
           disabled={nka}
         >
@@ -346,7 +345,7 @@ function RadioRow({ value, onChange, options }) {
   return (
     <div className="radio-row">
       {options.map((opt) => (
-        <label key={opt} className="radio-opt">
+        <label key={opt} className="radio-opt pad">
           <input
             type="radio"
             checked={value === opt}
@@ -367,7 +366,7 @@ function CheckboxRow({ options, values, onChange }) {
   return (
     <div className="check-row">
       {options.map((opt) => (
-        <label key={opt} className="check-opt">
+        <label key={opt} className="check-opt pad">
           <input
             type="checkbox"
             checked={(values || []).includes(opt)}
@@ -380,6 +379,91 @@ function CheckboxRow({ options, values, onChange }) {
   );
 }
 
+/* ---------------- AI call ---------------- */
+async function callOpenAI(prompt) {
+  const apiKey = process.env.REACT_APP_OPENAI_API_KEY;
+  if (!apiKey)
+    throw new Error("Missing API key. Set REACT_APP_OPENAI_API_KEY.");
+  const body = {
+    model: "gpt-4o-mini",
+    temperature: 0.2,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are an experienced NHS A&E triage assistant. Respond with ONLY valid JSON and keep it concise, safe, and professional.",
+      },
+      { role: "user", content: prompt },
+    ],
+  };
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`OpenAI error ${res.status}: ${t}`);
+  }
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content || "";
+  // Extract first JSON object from content (handles code fences)
+  const match = content.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("Model did not return JSON.");
+  return JSON.parse(match[0]);
+}
+
+/* Builds the triage prompt */
+function buildTriagePrompt({
+  patient,
+  reason,
+  reasonSummary,
+  onsetBucket,
+  meds,
+  allergies,
+  nka,
+  notes,
+  formType,
+  symptoms,
+}) {
+  const safeAllergies = formatAllergyList(allergies, nka);
+
+  return `You are an A&E triage assistant for the NHS. Use cautious UK clinical practice.
+Given the intake below, return ONLY a JSON object with these fields:
+{
+  "triage_category": "Very Urgent" | "Urgent" | "Standard",
+  "primary_diagnosis": { "label": string, "probability_percent": number, "rationale": string },
+  "secondary_diagnosis": { "label": string, "probability_percent": number, "rationale": string },
+  "red_flags": [string],
+  "recommended_actions": [ { "label": string, "is_time_critical": boolean } ],
+  "summary": string  // <=120 words, plain English sentences describing case & plan.
+}
+
+Rules:
+- Prioritise life/limb threats. If ambiguous, be conservative.
+- No drug dosing. Keep concise, professional, and English only.
+- Reflect pregnancy considerations if relevant.
+
+INTAKE
+Patient: ${patient.firstName} ${patient.lastName || ""} | Age ${
+    patient.age || "?"
+  } | Gender ${patient.sex || "?"}
+Allergies: ${safeAllergies}
+Current meds: ${meds && meds.length ? meds.join(", ") : "Unknown"}
+Complaint: ${reason?.label || "Unknown"}${
+    onsetBucket ? ` | Onset ${onsetBucket}` : ""
+  }
+One_line_summary: ${reasonSummary || "—"}
+Symptoms_form_type: ${formType}
+Symptoms_key: ${JSON.stringify(symptoms)}
+Triage_notes: ${notes || "—"}
+
+Return JSON only.`;
+}
+
 /* ---------------- main app ---------------- */
 export default function App() {
   const [step, setStep] = useState(1);
@@ -389,7 +473,6 @@ export default function App() {
   const [lastName, setLastName] = useState("");
   const [dob, setDob] = useState("");
   const [sex, setSex] = useState(""); // displayed as “Gender”
-  const [preferredLanguage, setPreferredLanguage] = useState("English");
   const [allergies, setAllergies] = useState([]); // [{allergen,reaction}]
   const [nka, setNka] = useState(false); // No Known Allergies
   const [meds, setMeds] = useState([]);
@@ -432,228 +515,123 @@ export default function App() {
   /* Step 4 (AI) */
   const [aiLoading, setAiLoading] = useState(false);
   const [aiResult, setAiResult] = useState(null);
+  const [aiError, setAiError] = useState("");
 
-  // tiny demo inference (replace with your LLM call)
-  function pickDiagnoses(reason, s) {
-    if (reason === "chest_pain") {
-      const highPain = Number(s.pain_score) >= 7;
-      const concerning =
-        s.diaphoresis === "Yes" ||
-        s.syncope === "Yes" ||
-        s.exertional === "Yes";
-      return [
-        {
-          condition: "Acute coronary syndrome",
-          confidence: concerning || highPain ? 70 : 55,
-          rationale: "Features concerning for cardiac pain.",
-        },
-        {
-          condition: "Musculoskeletal chest wall pain",
-          confidence: concerning ? 10 : 25,
-          rationale: "Common alternative if reproducible, non-exertional.",
-        },
-      ];
-    }
-    if (["short_breath", "asthma", "copd"].includes(reason)) {
-      return [
-        {
-          condition: "Acute asthma/COPD exacerbation",
-          confidence: 65,
-          rationale: "SOB ± wheeze, likely bronchospasm.",
-        },
-        {
-          condition: "Infective pneumonia",
-          confidence: 25,
-          rationale: "SOB with cough/fever.",
-        },
-      ];
-    }
-    if (reason === "stroke_symptoms") {
-      return [
-        {
-          condition: "Acute ischaemic stroke",
-          confidence: 70,
-          rationale: "FAST positive; consider thrombolysis window.",
-        },
-        {
-          condition: "Stroke mimic (seizure/migraine)",
-          confidence: 20,
-          rationale: "Consider if atypical course.",
-        },
-      ];
-    }
+  // simple local heuristic fallback if API fails
+  function localFallback() {
+    const reason = selectedReason;
+    let triage = ["chest_pain", "short_breath", "stroke_symptoms"].includes(
+      reason
+    )
+      ? "Very Urgent"
+      : reason === "head_injury"
+      ? "Urgent"
+      : "Standard";
+
     if (
-      ["limb_pain", "fracture_suspected", "sprain_strain", "fall"].includes(
-        reason
-      )
-    ) {
-      const nv = symptoms.nv_compromise === "Yes";
-      const wb = symptoms.weight_bearing === "No";
-      const deform = symptoms.deformity === "Yes";
-      const primaryIsFracture = deform || nv || wb;
-      return primaryIsFracture
-        ? [
-            {
-              condition: "Suspected fracture",
-              confidence: 65,
-              rationale: "Deformity/NV compromise or unable to weight-bear.",
-            },
-            {
-              condition: "Soft-tissue injury",
-              confidence: 20,
-              rationale: "If X-ray normal.",
-            },
-          ]
-        : [
-            {
-              condition: "Soft-tissue injury",
-              confidence: 60,
-              rationale: "Common; intact NV status; WB possible.",
-            },
-            {
-              condition: "Suspected fracture",
-              confidence: 25,
-              rationale: "Focal bony tenderness warrants X-ray.",
-            },
-          ];
-    }
-    if (reason === "abdo_pain") {
-      return [
-        {
-          condition: "Non-specific abdominal pain",
-          confidence: 45,
-          rationale: "Common in ED; clarify with exam/labs.",
-        },
-        {
-          condition: "Appendicitis/biliary/renal colic",
-          confidence: 30,
-          rationale: "Depends on quadrant & urinary features.",
-        },
-      ];
-    }
-    if (["uti", "flank_pain"].includes(reason)) {
-      return [
-        {
-          condition: "Urinary tract infection",
-          confidence: 55,
-          rationale: "Dysuria/frequency; dip/culture.",
-        },
-        {
-          condition: "Renal colic or pyelonephritis",
-          confidence: 25,
-          rationale: "Flank pain or fever.",
-        },
-      ];
-    }
-    return [
-      {
-        condition: "Non-specific presentation",
-        confidence: 40,
-        rationale: "Requires further assessment.",
+      formType === "CHEST_PAIN" &&
+      (symptoms.syncope === "Yes" || Number(symptoms.pain_score) >= 8)
+    )
+      triage = "Very Urgent";
+    if (formType === "STROKE" && symptoms.lkw) triage = "Very Urgent";
+    if (formType === "LIMB" && symptoms.nv_compromise === "Yes")
+      triage = "Urgent";
+
+    const primary = {
+      label: "Non-specific presentation",
+      probability_percent: 40,
+      rationale: "Requires further assessment.",
+    };
+    const secondary = {
+      label: "Alternate common cause",
+      probability_percent: 20,
+      rationale: "Refine with exam and vitals.",
+    };
+
+    const onset = onsetBucket ? ` Onset: ${onsetBucket}.` : "";
+    const assoc = symptoms.assoc
+      ? ` Associated symptoms: ${symptoms.assoc}.`
+      : "";
+    const summary = `${firstName} ${lastName}, ${age}${
+      sex ? ` (${sex})` : ""
+    }. Complaint: ${selectedReasonMeta?.label || "Unknown"}.${onset}${
+      reasonSummary ? ` Summary: ${reasonSummary}.` : ""
+    }${assoc} Proposed urgency: ${triage}.`;
+
+    setAiResult({
+      triageCategory: triage,
+      redFlags: [],
+      diagPrimary: {
+        condition: primary.label,
+        confidence: primary.probability_percent,
+        rationale: primary.rationale,
       },
-      {
-        condition: "Alternate common cause",
-        confidence: 20,
-        rationale: "To be refined with exam/vitals.",
+      diagSecondary: {
+        condition: secondary.label,
+        confidence: secondary.probability_percent,
+        rationale: secondary.rationale,
       },
-    ];
+      nextActions: [],
+      explanation: ["Fallback suggestions (API unavailable)."],
+      summary,
+    });
   }
 
-  function makeSuggestions() {
+  async function makeSuggestions() {
     setAiLoading(true);
-
-    setTimeout(() => {
-      const reason = selectedReason;
-      let triage = ["chest_pain", "short_breath", "stroke_symptoms"].includes(
-        reason
-      )
-        ? "Very Urgent"
-        : reason === "head_injury"
-        ? "Urgent"
-        : "Standard";
-
-      if (
-        formType === "CHEST_PAIN" &&
-        (symptoms.syncope === "Yes" || Number(symptoms.pain_score) >= 8)
-      )
-        triage = "Very Urgent";
-      if (formType === "STROKE" && symptoms.lkw) triage = "Very Urgent";
-      if (formType === "LIMB" && symptoms.nv_compromise === "Yes")
-        triage = "Urgent";
-
-      const [primary, secondary] = pickDiagnoses(reason, symptoms);
-
-      const redFlags = [
-        formType === "CHEST_PAIN" && symptoms.syncope === "Yes"
-          ? "Chest pain with syncope"
-          : "",
-        formType === "STROKE" && symptoms.lkw ? "Stroke window suspected" : "",
-        formType === "HEAD_INJ" &&
-        (symptoms.loc === "Yes" || symptoms.vomits === "≥2")
-          ? "Head injury with LOC/≥2 vomits"
-          : "",
-        sex === "female" &&
-        isPregnant &&
-        (reason === "preg_bleeding" || reason === "abdo_pain")
-          ? "Pregnancy + bleeding/abdo pain"
-          : "",
-      ].filter(Boolean);
-
-      const nextActions = [
-        reason === "chest_pain"
-          ? {
-              id: "ecg",
-              label: "12-lead ECG within 10 minutes",
-              accepted: true,
-              hint: "Time-critical",
-            }
-          : null,
-        reason === "fever" || reason === "short_breath"
-          ? {
-              id: "obs",
-              label: "Full set of observations + NEWS2",
-              accepted: true,
-            }
-          : null,
-        reason === "stroke_symptoms"
-          ? { id: "ct", label: "CT head (non-contrast)", accepted: false }
-          : null,
-      ].filter(Boolean);
-
-      // Plain-English summary at the end
-      const assoc = symptoms.assoc
-        ? ` Associated symptoms: ${symptoms.assoc}.`
-        : "";
-      const onset = onsetBucket ? ` Onset: ${onsetBucket}.` : "";
-      const pcs = `${firstName} ${lastName}, ${age} ${
-        sex ? `(${sex})` : ""
-      }. Complaint: ${selectedReasonMeta?.label || "Unknown"}.${onset}${
-        reasonSummary ? ` Summary: ${reasonSummary}.` : ""
-      }${assoc} Proposed urgency: ${triage}.`;
+    setAiError("");
+    try {
+      const prompt = buildTriagePrompt({
+        patient: { firstName, lastName, age, sex },
+        reason: selectedReasonMeta,
+        reasonSummary,
+        onsetBucket,
+        meds,
+        allergies,
+        nka,
+        notes,
+        formType,
+        symptoms,
+      });
+      const json = await callOpenAI(prompt);
 
       setAiResult({
-        triageCategory: triage,
-        redFlags,
-        diagPrimary: {
-          condition: primary.condition,
-          confidence: primary.confidence,
-          rationale: primary.rationale,
-        },
-        diagSecondary: {
-          condition: secondary.condition,
-          confidence: secondary.confidence,
-          rationale: secondary.rationale,
-        },
-        nextActions,
+        triageCategory: json.triage_category || "Standard",
+        redFlags: Array.isArray(json.red_flags) ? json.red_flags : [],
+        diagPrimary: json.primary_diagnosis
+          ? {
+              condition: json.primary_diagnosis.label,
+              confidence: json.primary_diagnosis.probability_percent,
+              rationale: json.primary_diagnosis.rationale,
+            }
+          : null,
+        diagSecondary: json.secondary_diagnosis
+          ? {
+              condition: json.secondary_diagnosis.label,
+              confidence: json.secondary_diagnosis.probability_percent,
+              rationale: json.secondary_diagnosis.rationale,
+            }
+          : null,
+        nextActions: Array.isArray(json.recommended_actions)
+          ? json.recommended_actions.map((a) => ({
+              id: a.label,
+              label: a.label,
+              accepted: false,
+              hint: a.is_time_critical ? "Time-critical" : "",
+            }))
+          : [],
         explanation: [
-          "Urgency adjusted using complaint and symptom flags.",
-          "NEWS2 to be computed on vitals entry.",
-          "Orders are suggestions and require clinician sign-off.",
+          "Model-generated based on intake; clinician sign-off required.",
         ],
-        summary: pcs,
+        summary: json.summary || "",
       });
+    } catch (err) {
+      console.error(err);
+      setAiError(err.message || "AI error");
+      localFallback();
+    } finally {
       setAiLoading(false);
-    }, 220);
+    }
   }
 
   /* ---------------- render ---------------- */
@@ -719,10 +697,10 @@ export default function App() {
                 {showValidate && !dob && <div className="error">Required</div>}
               </div>
 
-              <div className="stack">
-                <label className="muted">Gender *</label>
+              <fieldset className="stack fieldset">
+                <legend className="muted">Gender *</legend>
                 <div className="row sex-row">
-                  <label className="row sex-opt">
+                  <label className="row sex-opt pad">
                     <input
                       type="radio"
                       checked={sex === "female"}
@@ -730,7 +708,7 @@ export default function App() {
                     />{" "}
                     Female
                   </label>
-                  <label className="row sex-opt">
+                  <label className="row sex-opt pad">
                     <input
                       type="radio"
                       checked={sex === "male"}
@@ -740,25 +718,11 @@ export default function App() {
                   </label>
                 </div>
                 {showValidate && !sex && (
-                  <div className="error">Please select one</div>
+                  <div className="error" id="gender-error">
+                    Please select one
+                  </div>
                 )}
-              </div>
-
-              <div className="stack">
-                <label className="muted">
-                  Preferred language (for summary)
-                </label>
-                <select
-                  className="input"
-                  value={preferredLanguage}
-                  onChange={(e) => setPreferredLanguage(e.target.value)}
-                >
-                  <option>English</option>
-                  <option>Français</option>
-                  <option>Español</option>
-                  <option>Polski</option>
-                </select>
-              </div>
+              </fieldset>
             </div>
 
             <div className="grid grid-2 mt-16">
@@ -882,6 +846,7 @@ export default function App() {
             aiResult={aiResult}
             setAiResult={setAiResult}
             onBack={() => setStep(3)}
+            aiError={aiError}
           />
         )}
       </div>
@@ -900,7 +865,7 @@ function MedsInput({ values, onChange }) {
   }
   return (
     <div className="stack">
-      <div className="row">
+      <div className="row wrap">
         <input
           className="input"
           value={entry}
@@ -913,7 +878,7 @@ function MedsInput({ values, onChange }) {
             }
           }}
         />
-        <button type="button" onClick={addEntry} className="btn btn-secondary">
+        <button type="button" onClick={addEntry} className="btn btn-neutral">
           Add
         </button>
       </div>
@@ -965,7 +930,7 @@ function ReasonStep(props) {
             ← Back
           </button>
           <button
-            className="btn btn-secondary"
+            className="btn btn-neutral"
             onClick={() => {
               setSelectedReason("");
               setOnsetBucket("");
@@ -1073,7 +1038,7 @@ function ReasonStep(props) {
         </div>
         <div className="row gap-8">
           <button
-            className="btn btn-secondary"
+            className="btn btn-neutral"
             onClick={() => setSelectedReason("")}
           >
             Clear
@@ -1102,7 +1067,6 @@ function SymptomsStep({
   const s = symptoms;
   const set = (k, v) => setSymptoms((prev) => ({ ...prev, [k]: v }));
 
-  // Note: No resets on every render — keeps typing smooth in “Other associated symptoms”
   function Panel() {
     if (formType === "CHEST_PAIN")
       return (
@@ -1565,7 +1529,7 @@ function SymptomsStep({
             ← Back
           </button>
           <button
-            className="btn btn-secondary"
+            className="btn btn-neutral"
             onClick={() => setSymptoms(defaultSymptoms(formType))}
           >
             Reset
@@ -1608,6 +1572,7 @@ function AIStep({
   aiResult,
   setAiResult,
   onBack,
+  aiError,
 }) {
   function allergyDisplay() {
     return formatAllergyList(allergies, nka);
@@ -1627,7 +1592,7 @@ function AIStep({
             ← Back
           </button>
           <button
-            className="btn btn-secondary"
+            className="btn btn-neutral"
             onClick={() => alert("Saved (demo)")}
           >
             Save
@@ -1659,6 +1624,12 @@ function AIStep({
           <span className="pill redflag">Red flag: NV compromise</span>
         )}
       </div>
+
+      {aiError && (
+        <div className="banner" style={{ marginTop: 12 }}>
+          AI: {aiError} • Showing fallback.
+        </div>
+      )}
 
       {aiLoading ? (
         <div className="skeleton-wrap">
@@ -1776,7 +1747,7 @@ function AIStep({
             )}
             <div className="row gap-8 mt-8">
               <button
-                className="btn btn-secondary"
+                className="btn btn-neutral"
                 onClick={() =>
                   setAiResult((prev) =>
                     prev
